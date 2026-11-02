@@ -1,0 +1,238 @@
+name: Images
+
+# Container images for the deployable services, built from the repository root so every image is
+# self-contained (see each Dockerfile). On a pull request the images are built and discarded, which
+# is what proves the Dockerfiles; on main (and on demand) they are pushed to GHCR as
+# ghcr.io/<owner>/autonoma-<name>:sha-<12 chars>, and the bump job hands the pinned tag@digest
+# references to infra-gitops.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: images-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/autonoma
+  # Baked into the UI bundle: the API's public origin and the parent domain of the session cookie.
+  UI_API_URL: https://autonoma-api.shs.cx
+  UI_INTERNAL_DOMAIN: shs.cx
+
+jobs:
+  build:
+    name: ${{ matrix.image.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: api
+            dockerfile: apps/api/Dockerfile
+          - name: ui
+            dockerfile: apps/ui/Dockerfile
+          - name: worker-web
+            dockerfile: apps/workers/web/Dockerfile
+          - name: worker-general
+            dockerfile: apps/workers/general/Dockerfile
+          - name: worker-diffs
+            dockerfile: apps/workers/diffs/Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Each image carries the monorepo's node_modules (about 2 GB) and the builder stage holds a
+      # second copy; the toolchains ubuntu-latest preinstalls and this build never touches are
+      # removed first so the job does not run out of disk mid-copy.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Image tag
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ env.IMAGE_PREFIX }}-${{ matrix.image.name }}:${{ steps.meta.outputs.tag }}
+          # Only the UI Dockerfile declares these; the others ignore them with a warning.
+          build-args: |
+            VITE_API_URL=${{ env.UI_API_URL }}
+            VITE_INTERNAL_DOMAIN=${{ env.UI_INTERNAL_DOMAIN }}
+          # A plain single-platform manifest, so the digest below is the one a `tag@digest` pin
+          # addresses - with provenance on, buildx pushes an index that wraps an attestation too.
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Record the pushed reference
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p refs
+          echo "${IMAGE_PREFIX}-${{ matrix.image.name }}:${{ steps.meta.outputs.tag }}@${{ steps.build.outputs.digest }}" | tee "refs/${{ matrix.image.name }}"
+
+      - name: Upload the reference
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-ref-${{ matrix.image.name }}
+          path: refs/
+          retention-days: 7
+
+      # GitHub has no API that changes a package's visibility, so this only reports. A package
+      # that is still private after the first push is made public once, by hand:
+      # github.com/users/<owner>/packages/container/autonoma-<name>/settings -> Danger Zone ->
+      # Change visibility -> Public. The cluster pulls anonymously, so it stays a notice until then.
+      - name: Report package visibility
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          visibility=$(gh api "/users/${{ github.repository_owner }}/packages/container/autonoma-${{ matrix.image.name }}" --jq .visibility 2>/dev/null || echo "unknown")
+          echo "package autonoma-${{ matrix.image.name }} visibility: ${visibility}"
+          if [ "$visibility" != "public" ]; then
+            echo "::notice title=GHCR package not public::autonoma-${{ matrix.image.name }} is '${visibility}'. Make it public once in the package settings (Danger Zone -> Change visibility) so the cluster can pull it without credentials."
+          fi
+
+  bump:
+    name: Bump infra-gitops
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      # The `secrets` context is not available in a job-level `if`, so the gate is a step.
+      BUMP_APP_ID: ${{ secrets.INFRA_GITOPS_BUMP_APP_ID }}
+      BUMP_APP_PRIVATE_KEY: ${{ secrets.INFRA_GITOPS_BUMP_APP_PRIVATE_KEY }}
+      GITOPS_REPOSITORY: infra-gitops
+      GITOPS_COMPONENT_DIR: components/autonoma
+    steps:
+      - name: Check the bump credentials
+        id: gate
+        run: |
+          if [ -z "$BUMP_APP_ID" ] || [ -z "$BUMP_APP_PRIVATE_KEY" ]; then
+            echo "::notice title=infra-gitops bump skipped::Repository secrets INFRA_GITOPS_BUMP_APP_ID and INFRA_GITOPS_BUMP_APP_PRIVATE_KEY are not set. The images were pushed; infra-gitops keeps its current references until the secrets exist."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: autonoma
+          sparse-checkout: scripts
+
+      - name: Download the image references
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-ref-*
+          merge-multiple: true
+          path: refs
+
+      - name: Mint the GitHub App token
+        if: steps.gate.outputs.enabled == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ env.BUMP_APP_ID }}
+          private-key: ${{ env.BUMP_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ env.GITOPS_REPOSITORY }}
+
+      - name: Checkout infra-gitops
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/${{ env.GITOPS_REPOSITORY }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+
+      - name: Rewrite the image references
+        if: steps.gate.outputs.enabled == 'true'
+        id: rewrite
+        run: |
+          if [ ! -d "gitops/${GITOPS_COMPONENT_DIR}" ]; then
+            echo "::notice title=infra-gitops bump skipped::${GITOPS_REPOSITORY} has no ${GITOPS_COMPONENT_DIR}/ yet; nothing to rewrite."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node autonoma/scripts/bump-gitops-images.mjs "gitops/${GITOPS_COMPONENT_DIR}" refs/* | tee rewrite.log
+          if grep -q '^changed: 0$' rewrite.log; then
+            echo "::notice title=infra-gitops already current::Every reference under ${GITOPS_COMPONENT_DIR}/ already points at these images."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open the pull request
+        if: steps.rewrite.outputs.changed == 'true'
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          short="${GITHUB_SHA::12}"
+          branch="autonoma-images/${short}"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add "${GITOPS_COMPONENT_DIR}"
+          {
+            echo "autonoma: images ${short}"
+            echo
+            echo "Source: ${SOURCE_URL}"
+            echo "Build: ${RUN_URL}"
+            echo
+            cat ../refs/*
+          } > ../commit-message.txt
+          git commit -F ../commit-message.txt
+          git push origin "$branch"
+          {
+            echo "Pinned image references for autonoma commit ${short} (${SOURCE_URL})."
+            echo
+            echo '```'
+            cat ../refs/*
+            echo '```'
+            echo
+            echo "Built by ${RUN_URL}."
+          } > ../pr-body.md
+          gh pr create --title "autonoma: images ${short}" --body-file ../pr-body.md --head "$branch" --base main
+          # Auto-merge needs the repository setting "Allow auto-merge" and something for the merge
+          # to wait on; without them GitHub refuses, and the PR is left for a manual merge.
+          gh pr merge --auto --squash "$branch" || echo "::notice title=auto-merge not enabled::The infra-gitops PR for ${short} is open but could not be queued for auto-merge; merge it by hand."

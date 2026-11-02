@@ -16,6 +16,10 @@ export const env = createEnv({
         // cluster-wide Redis, which every environment shares; see auth.ts.
         NAMESPACE: z.string().default("local"),
         INTERNAL_DOMAIN: z.string().optional().default("autonoma.app"),
+        // Comma-separated email domains whose accounts are internal (admins of the internal
+        // organization). Unset means INTERNAL_DOMAIN alone; set it when staff mail does not run on
+        // the domain the app is served from - see internal-email-domains.ts.
+        INTERNAL_EMAIL_DOMAINS: z.string().optional(),
         // Organization id of the single read-only demo org. When set, every mutation
         // whose active org is this id is rejected at the API layer (see writeProcedure
         // in trpc.ts), so the org powering the public demo can be browsed but never
@@ -81,6 +85,9 @@ export const env = createEnv({
         AUTHENTIK_CLIENT_SECRET: z.string().min(1).optional(),
         GOOGLE_CLIENT_ID: z.string().min(1).optional(),
         GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
+        // Comma-separated Google Workspace domains allowed to sign in, matched against the id
+        // token's `hd` claim. Unset admits every Google account - see google-hosted-domain-gate.ts.
+        GOOGLE_ALLOWED_HD: z.string().optional(),
 
         // Credentials of the GitHub OAuth app backing GitHub sign-in. Unrelated to
         // the GITHUB_APP_* secrets below, which authenticate the repo-facing GitHub
