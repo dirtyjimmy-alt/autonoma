@@ -12,14 +12,7 @@ import { env } from "./env";
  * rather than taking down the worker.
  */
 export function createModelSession(): ModelSession {
-    if (env.OPENAI_API_KEY == null) {
-        throw new Error(
-            "OPENAI_API_KEY is not configured on the diffs worker; the analysis pipeline cannot run. " +
-                "Provision it on the diffs worker.",
-        );
-    }
     return openModelSession({
-        openaiApiKey: env.OPENAI_API_KEY,
         classifierModelId: env.INVESTIGATION_CLASSIFIER_MODEL,
         impactModelId: env.INVESTIGATION_IMPACT_MODEL,
         videoModelId: env.INVESTIGATION_VIDEO_MODEL,

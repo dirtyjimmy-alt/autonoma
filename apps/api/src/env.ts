@@ -75,8 +75,12 @@ export const env = createEnv({
         // API must still boot everywhere else - the endpoint stays inert when unset.
         AUTONOMA_SHARED_SECRET: z.string().optional(),
         AUTONOMA_SIGNING_SECRET: z.string().optional(),
-        GOOGLE_CLIENT_ID: z.string().min(1),
-        GOOGLE_CLIENT_SECRET: z.string().min(1),
+        AUTH_PROVIDER: z.enum(["social", "authentik"]).default("social"),
+        AUTHENTIK_ISSUER: z.string().url().optional(),
+        AUTHENTIK_CLIENT_ID: z.string().min(1).optional(),
+        AUTHENTIK_CLIENT_SECRET: z.string().min(1).optional(),
+        GOOGLE_CLIENT_ID: z.string().min(1).optional(),
+        GOOGLE_CLIENT_SECRET: z.string().min(1).optional(),
 
         // Credentials of the GitHub OAuth app backing GitHub sign-in. Unrelated to
         // the GITHUB_APP_* secrets below, which authenticate the repo-facing GitHub
@@ -130,11 +134,10 @@ export const env = createEnv({
         AGENT_VERSION: z.string().optional().default("latest"),
         POSTHOG_KEY: z.string().optional(),
         POSTHOG_HOST: z.string().optional().default("https://us.i.posthog.com"),
-        GROQ_KEY: z.string().min(1).optional(),
-        OPENROUTER_API_KEY: z.string().min(1).optional(),
+        ZAI_API_KEY: z.string().min(1).optional(),
         // Master switch for the managed LLM proxy (planner CLI). Off by default so
         // the route is never mounted unless explicitly enabled - a billing-disabled
-        // environment with OPENROUTER_API_KEY set must NOT silently become a free,
+        // environment with ZAI_API_KEY set must NOT silently become a free,
         // unmetered LLM gateway. Metering only happens when STRIPE_ENABLED is also on.
         LLM_PROXY_ENABLED: z.stringbool().default(false),
         // Comma-separated allowlist of OpenRouter model ids the managed LLM proxy

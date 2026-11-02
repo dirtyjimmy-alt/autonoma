@@ -29,16 +29,9 @@ The agent abstraction (`agent/`) and compaction strategies (`compaction/`) moved
 
 ## Model Registry
 
-`ModelRegistry<TModel>` manages LLM instances with built-in usage tracking, cost calculation, and monitoring middleware. Models are defined as entries in `MODEL_ENTRIES` (primary providers) or `OPENROUTER_MODEL_ENTRIES` (OpenRouter fallback).
+`ModelRegistry<TModel>` manages LLM instances with usage tracking, pricing and monitoring. All runtime entries resolve directly to Z.ai `glm-5.3-flash` using the standard API endpoint and `ZAI_API_KEY`. The model supports text, images and video; video uses inline MP4 rather than Google Files.
 
-Available models:
-
-- `GEMINI_3_FLASH_PREVIEW` - Google Gemini (default for tests and scripts); video-capable
-- `GEMINI_3_5_FLASH_LITE` - Google Gemini Flash-Lite; cheaper/faster, web agent-loop model; video-capable
-- `QWEN3_VL_32B` - Qwen3-VL via OpenRouter; grounding/pointer model (provider pinned to structured-output-capable providers)
-- `MINISTRAL_8B` - Mistral via OpenRouter
-- `GPT_OSS_120B` - OpenAI OSS via Groq or OpenRouter
-- `MINIMAX_M3` - MiniMax via OpenRouter; video-capable
+Use `MODEL_ENTRIES.ZAI_GLM_FLASH` for new consumers. Historical model keys and `OPENROUTER_MODEL_ENTRIES` remain aliases for compatibility with existing configurations; they do not contact their former providers. JSON schema requests are sent using Z.ai JSON mode with the schema in the prompt; the AI SDK validates the response locally. Prices are defined once in `@autonoma/types` (`ZAI_MODEL`).
 
 ```ts
 import { ModelRegistry, MODEL_ENTRIES } from "@autonoma/ai";
@@ -49,7 +42,7 @@ const registry = new ModelRegistry({
 });
 
 const model = registry.getModel({
-    model: "GEMINI_3_FLASH_PREVIEW",
+    model: "ZAI_GLM_FLASH",
     tag: "my-feature",
     reasoning: "low",
 });
@@ -88,7 +81,7 @@ const records = costCollector.getRecords();
 const registry = new ModelRegistry({ models: MODEL_ENTRIES });
 
 const costCollector = new CostCollector();
-const model = registry.getModel({ model: "GEMINI_3_FLASH_PREVIEW", tag: "my-feature" }, costCollector);
+const model = registry.getModel({ model: "ZAI_GLM_FLASH", tag: "my-feature" }, costCollector);
 
 // ... run AI calls with `model` ...
 
@@ -173,10 +166,7 @@ A video-capable model and the uploader its provider requires are declared togeth
 const registry = new ModelRegistry({ models: MODEL_ENTRIES });
 
 // { model, uploader } - the uploader matches the model's provider automatically.
-const { model, uploader } = registry.getVideoModel(
-    { model: "GEMINI_3_FLASH_PREVIEW", tag: "my-feature" },
-    costCollector,
-);
+const { model, uploader } = registry.getVideoModel({ model: "ZAI_GLM_FLASH", tag: "my-feature" }, costCollector);
 ```
 
 `getVideoModel` wraps the model exactly like `getModel` (same monitoring/cost middleware) and throws `NotAVideoModelError` if the selected entry declares no `createUploader`.

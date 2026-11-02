@@ -27,6 +27,7 @@
         "@autonoma/agent-core": "workspace:*",
         "@autonoma/errors": "workspace:*",
         "@autonoma/logger": "workspace:*",
+        "@autonoma/types": "workspace:*",
         "@autonoma/utils": "workspace:*",
         "@google/genai": "^1.42.0",
         "@openrouter/ai-sdk-provider": "^3.0.0",

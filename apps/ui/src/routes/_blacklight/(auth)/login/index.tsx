@@ -39,6 +39,7 @@ interface SocialProviderPresentation {
 
 // Presentation only - which of these are offered is the server's call, not this map's.
 const SOCIAL_PROVIDER_PRESENTATION: Record<SocialProvider, SocialProviderPresentation> = {
+  authentik: { label: "Continue with authentik", icon: undefined },
   google: { label: "Continue with Google", icon: <Google /> },
   github: { label: "Continue with GitHub", icon: <GithubLogoIcon weight="fill" className="size-4" /> },
   microsoft: { label: "Continue with Microsoft", icon: <Microsoft /> },
@@ -110,14 +111,17 @@ function useSocialSignIn() {
     setPendingProvider(provider);
     rememberProvider(provider);
     try {
-      const { error } = await authClient.signIn.social({
-        provider,
+      const signInOptions = {
         // Lands on the organization picker, which forwards to `redirectTo` once there is an
         // organization to act as. Validated: this survives the round trip through the provider and
         // is then handed to the browser, so an unchecked value here is an open redirect.
         callbackURL: postSignInUrl(window.location.origin, redirectTo),
         errorCallbackURL: `${window.location.origin}/login`,
-      });
+      };
+      const { error } =
+        provider === "authentik"
+          ? await authClient.signIn.oauth2({ providerId: provider, ...signInOptions })
+          : await authClient.signIn.social({ provider, ...signInOptions });
       // The client resolves with `{ error }` rather than throwing (better-fetch only
       // throws when configured to), so a failed request lands here, not in the catch.
       // Without this the button would sit on "Signing in..." forever.

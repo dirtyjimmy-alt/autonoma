@@ -25,12 +25,12 @@
         "@autonoma/ai": "workspace:*",
         "@autonoma/errors": "workspace:*",
         "@autonoma/image": "workspace:*",
+        "@autonoma/logger": "workspace:*",
         "@google/genai": "^1.42.0",
         "ai": "catalog:",
         "zod": "catalog:"
     },
     "devDependencies": {
-        "@autonoma/logger": "workspace:*",
         "dotenv": "catalog:",
         "typescript": "catalog:",
         "vitest": "catalog:"

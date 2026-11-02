@@ -16,6 +16,7 @@ import { betterAuth } from "better-auth/minimal";
 import { jwt, mcp, oAuthProxy, organization } from "better-auth/plugins";
 import type { CookieOptions } from "hono/utils/cookie";
 import type Redis from "ioredis";
+import { authentikProvider } from "./authentik-provider";
 import { env } from "./env";
 import { microsoftDomainAssertion } from "./microsoft-domain-assertion";
 import { PlatformEventEmitter } from "./posthog/emit-platform-events";
@@ -445,7 +446,7 @@ async function resolveSessionOrg(
     return ensureOrgMembership(conn, userId, email, name);
 }
 
-const SOCIAL_PROVIDER_IDS = ["google", "github", "microsoft"] as const;
+const SOCIAL_PROVIDER_IDS = ["google", "github", "microsoft", "authentik"] as const;
 export type SocialProviderId = (typeof SOCIAL_PROVIDER_IDS)[number];
 interface GithubProviderConfig {
     clientId: string;
@@ -547,8 +548,22 @@ function readClaimString(profile: unknown, claim: string): string | undefined {
 const GITHUB_PROVIDER = githubProvider();
 const MICROSOFT_PROVIDER = microsoftProvider();
 
+function authentikPlugins() {
+    if (env.AUTH_PROVIDER !== "authentik") return [];
+    const issuer = env.AUTHENTIK_ISSUER;
+    const clientId = env.AUTHENTIK_CLIENT_ID;
+    const clientSecret = env.AUTHENTIK_CLIENT_SECRET;
+    if (issuer == null || clientId == null || clientSecret == null) {
+        throw new Error("Authentik requires AUTHENTIK_ISSUER, AUTHENTIK_CLIENT_ID and AUTHENTIK_CLIENT_SECRET");
+    }
+    return [authentikProvider({ issuer, clientId, clientSecret })];
+}
+
 function resolveEnabledSocialProviders(): SocialProviderId[] {
-    // Google's credentials are required by env validation, so it is always available.
+    if (env.AUTH_PROVIDER === "authentik") return ["authentik"];
+    if (env.GOOGLE_CLIENT_ID == null || env.GOOGLE_CLIENT_SECRET == null) {
+        throw new Error("Social authentication requires GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET");
+    }
     const providers: SocialProviderId[] = ["google"];
     if (GITHUB_PROVIDER != null) providers.push("github");
     if (MICROSOFT_PROVIDER != null) providers.push("microsoft");
@@ -564,6 +579,7 @@ function resolveEnabledSocialProviders(): SocialProviderId[] {
 export const ENABLED_SOCIAL_PROVIDERS: readonly SocialProviderId[] = resolveEnabledSocialProviders();
 
 const SOCIAL_PROVIDER_LABELS: Record<SocialProviderId, string> = {
+    authentik: "authentik",
     google: "Google",
     microsoft: "Microsoft",
     github: "GitHub",
@@ -640,7 +656,7 @@ export function buildAuth({ redisClient, conn, platformEvents: injectedPlatformE
             keyPrefix: `better-auth:${env.NAMESPACE}:`,
         }),
         emailAndPassword: {
-            enabled: env.PREVIEWKIT_ENV || TEST_ACCOUNT_ALLOWED_EMAILS.size > 0,
+            enabled: env.AUTH_PROVIDER !== "authentik" && (env.PREVIEWKIT_ENV || TEST_ACCOUNT_ALLOWED_EMAILS.size > 0),
         },
         hooks: {
             // Password sign-in/sign-up in production is reserved for
@@ -717,42 +733,45 @@ export function buildAuth({ redisClient, conn, platformEvents: injectedPlatformE
         onAPIError: {
             errorURL: `${APP_URL}/login/workspace-required`,
         },
-        socialProviders: {
-            google: {
-                clientId: env.GOOGLE_CLIENT_ID,
-                clientSecret: env.GOOGLE_CLIENT_SECRET,
-                scope: ["openid", "email", "profile"],
-                getUserInfo: async (token) => {
-                    if (token.idToken == null) return null;
-                    const payload = decodeIdTokenPayload(token.idToken);
-                    if (payload.email == null || payload.email === "") return null;
+        socialProviders:
+            env.AUTH_PROVIDER === "authentik"
+                ? {}
+                : {
+                      google: {
+                          clientId: env.GOOGLE_CLIENT_ID ?? "",
+                          clientSecret: env.GOOGLE_CLIENT_SECRET ?? "",
+                          scope: ["openid", "email", "profile"],
+                          getUserInfo: async (token) => {
+                              if (token.idToken == null) return null;
+                              const payload = decodeIdTokenPayload(token.idToken);
+                              if (payload.email == null || payload.email === "") return null;
 
-                    // `hd` is Google stating that this address belongs to a Workspace domain it
-                    // administers, and it is the whole answer for this provider: signing in as
-                    // `someone@acme.com` requires acme.com to be a Workspace domain, and Workspace
-                    // always sends `hd` - so its absence means a consumer account. Recorded here
-                    // because this is the only point that sees the id token; `ensureOrgMembership`
-                    // picks it up when it chooses the organization.
-                    await rememberSignupDomainAssertion(redisClient, payload.email, {
-                        provider: "google",
-                        managedDomain: payload.hd,
-                    });
+                              // `hd` is Google stating that this address belongs to a Workspace domain it
+                              // administers, and it is the whole answer for this provider: signing in as
+                              // `someone@acme.com` requires acme.com to be a Workspace domain, and Workspace
+                              // always sends `hd` - so its absence means a consumer account. Recorded here
+                              // because this is the only point that sees the id token; `ensureOrgMembership`
+                              // picks it up when it chooses the organization.
+                              await rememberSignupDomainAssertion(redisClient, payload.email, {
+                                  provider: "google",
+                                  managedDomain: payload.hd,
+                              });
 
-                    return {
-                        user: {
-                            id: payload.sub ?? "",
-                            name: payload.name ?? payload.email ?? "",
-                            email: payload.email ?? "",
-                            image: payload.picture,
-                            emailVerified: payload.email_verified ?? false,
-                        },
-                        data: payload,
-                    };
-                },
-            },
-            github: GITHUB_PROVIDER,
-            microsoft: microsoftProviderWithAssertion(redisClient),
-        },
+                              return {
+                                  user: {
+                                      id: payload.sub ?? "",
+                                      name: payload.name ?? payload.email ?? "",
+                                      email: payload.email ?? "",
+                                      image: payload.picture,
+                                      emailVerified: payload.email_verified ?? false,
+                                  },
+                                  data: payload,
+                              };
+                          },
+                      },
+                      github: GITHUB_PROVIDER,
+                      microsoft: microsoftProviderWithAssertion(redisClient),
+                  },
         databaseHooks: {
             user: {
                 create: {
@@ -853,6 +872,7 @@ export function buildAuth({ redisClient, conn, platformEvents: injectedPlatformE
             },
         },
         plugins: [
+            ...authentikPlugins(),
             organization({
                 // The path list above already refuses `/organization/create`; this makes the plugin
                 // itself refuse, so a rename of the route upstream cannot quietly re-open it.

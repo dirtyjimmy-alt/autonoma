@@ -1,10 +1,8 @@
-import { AI_REQUEST_TIMEOUT_MS } from "@autonoma/ai";
-import { env } from "@autonoma/ai/env";
-import { external } from "@autonoma/errors";
+import { MODEL_ENTRIES, ModelRegistry, ObjectGenerator } from "@autonoma/ai";
 import type { ScreenResolution, Screenshot } from "@autonoma/image";
-import { Environment, type FunctionCall, GoogleGenAI } from "@google/genai";
+import { logger as rootLogger } from "@autonoma/logger";
+import type { FunctionCall } from "@google/genai";
 import z from "zod";
-import { GeminiModelRequestFailedError } from "../object/gemini-object-detector";
 import { PointDetector } from "./point-detector";
 
 export class GeminiNoToolCallsError extends Error {
@@ -39,21 +37,6 @@ export type GeminiComputerUseToolName =
     | "scroll_at"
     | "drag_and_drop";
 
-const EXCLUDED_TOOLS: GeminiComputerUseToolName[] = [
-    "open_web_browser",
-    "wait_5_seconds",
-    "go_back",
-    "go_forward",
-    "search",
-    "navigate",
-    "hover_at",
-    "type_text_at",
-    "key_combination",
-    "scroll_document",
-    "scroll_at",
-    "drag_and_drop",
-];
-
 const clickAtToolSchema = z.object({
     name: z.literal("click_at"),
     args: z.object({
@@ -65,28 +48,18 @@ const clickAtToolSchema = z.object({
 const computeUseToolSchema = z.discriminatedUnion("name", [clickAtToolSchema]);
 export type GoogleToolCall = z.infer<typeof computeUseToolSchema>;
 
-/**
- * Handles Gemini computer use requests, including the translation of tool call coords (0-1000)
- * to the actual screen resolution
- */
+/** Compatibility adapter for callers of the former computer-use model. */
 export class GeminiComputerUseModel {
-    private readonly googleAI: GoogleGenAI;
+    private readonly logger = rootLogger.child({ name: this.constructor.name });
+    private readonly generator: ObjectGenerator<{ x: number; y: number }>;
 
-    constructor(private readonly systemPrompt: string) {
-        this.googleAI = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-    }
-
-    private preprocessToolCall(toolCall: GoogleToolCall, resolution: ScreenResolution): GoogleToolCall {
-        switch (toolCall.name) {
-            case "click_at":
-                return {
-                    name: "click_at",
-                    args: {
-                        x: Math.round((toolCall.args.x / 1000) * resolution.width),
-                        y: Math.round((toolCall.args.y / 1000) * resolution.height),
-                    },
-                };
-        }
+    constructor(systemPrompt: string) {
+        const registry = new ModelRegistry({ models: { pointer: MODEL_ENTRIES.ZAI_GLM_FLASH } });
+        this.generator = new ObjectGenerator({
+            model: registry.getModel({ model: "pointer", tag: "computer-use-point" }),
+            schema: z.object({ x: z.number().min(0).max(1000), y: z.number().min(0).max(1000) }),
+            systemPrompt: systemPrompt + " Return the click point as x and y coordinates normalized to 0–1000.",
+        });
     }
 
     public async request(
@@ -94,68 +67,17 @@ export class GeminiComputerUseModel {
         instruction: string,
         resolution: ScreenResolution,
     ): Promise<GoogleToolCall[]> {
-        const response = await external(
-            () =>
-                this.googleAI.models.generateContent({
-                    model: "gemini-2.5-computer-use-preview-10-2025",
-                    contents: [
-                        {
-                            role: "user",
-                            parts: [{ text: instruction }],
-                        },
-                        {
-                            role: "user",
-                            parts: [
-                                {
-                                    inlineData: {
-                                        data: screenshot.base64,
-                                        mimeType: "image/png",
-                                    },
-                                },
-                            ],
-                        },
-                    ],
-                    config: {
-                        systemInstruction: this.systemPrompt,
-                        abortSignal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
-                        tools: [
-                            {
-                                computerUse: {
-                                    environment: Environment.ENVIRONMENT_BROWSER,
-                                    excludedPredefinedFunctions: EXCLUDED_TOOLS,
-                                },
-                            },
-                        ],
-                    },
-                }),
-            { wrapper: (error) => new GeminiModelRequestFailedError(error) },
-        );
-
-        if (response.candidates == null || response.candidates.length === 0)
-            throw new GeminiModelRequestFailedError(new Error("No response from Gemini model"));
-
-        // biome-ignore lint/style/noNonNullAssertion: Length > 0
-        const candidate = response.candidates[0]!;
-
-        const rawToolCalls =
-            candidate.content?.parts
-                ?.filter((part) => "functionCall" in part && part.functionCall != null)
-                // biome-ignore lint/style/noNonNullAssertion: ^^^ part.functionCall != null
-                ?.map((part) => part.functionCall!) ?? [];
-
-        if (rawToolCalls.length === 0) throw new GeminiNoToolCallsError(instruction);
-
-        const parseResults = rawToolCalls.map((toolCall) => computeUseToolSchema.safeParse(toolCall));
-
-        if (parseResults.some((result) => !result.success))
-            throw new GeminiInvalidToolCallsError(instruction, rawToolCalls);
-
-        return (
-            parseResults
-                // biome-ignore lint/style/noNonNullAssertion: result.success is true for all results
-                .map((result) => result.data!)
-                .map((toolCall) => this.preprocessToolCall(toolCall, resolution))
-        );
+        this.logger.info("Locating a click point with Z.ai", { resolution });
+        const point = await this.generator.generate({ userPrompt: instruction, images: [screenshot] });
+        const result: GoogleToolCall = {
+            name: "click_at",
+            args: {
+                x: Math.round((point.x / 1000) * resolution.width),
+                y: Math.round((point.y / 1000) * resolution.height),
+            },
+        };
+        this.logger.info("Located click point with Z.ai");
+        return [result];
     }
 }
 

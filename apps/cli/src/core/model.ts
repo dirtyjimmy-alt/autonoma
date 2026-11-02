@@ -1,9 +1,10 @@
+import { ZAI_MODEL } from "@autonoma/types";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import type { LanguageModel } from "ai";
 import { readEnv } from "../env";
 import { resolveApiUrl } from "./api-url";
 
-export const DEFAULT_MODEL = "google/gemini-3-flash-preview";
+export const DEFAULT_MODEL = ZAI_MODEL.id;
 
 // Passed as the AI SDK's `maxRetries` on every model call. The SDK default of 2 gave up on
 // transient provider blips after 3 attempts; 10 rides them out. The SDK handles the backoff and

@@ -639,3 +639,25 @@ Custom `APIError` subclasses (`NotFoundError`, `ConflictError`, `BadRequestError
 ### Dependency Injection
 
 Services are built in `src/routes/build-services.ts` via plain constructor injection - no DI framework. The `createContext` function in `src/context.ts` assembles the full tRPC context (database, auth session, services) for each request.
+
+## Self-hosted identity and LLM configuration
+
+Use `AUTH_PROVIDER=authentik` to offer authentik exclusively and disable password sign-in. Set
+`AUTHENTIK_ISSUER` to the application's issuer (for example,
+`https://auth.shs.cx/application/o/autonoma/`), `AUTHENTIK_CLIENT_ID`, and
+`AUTHENTIK_CLIENT_SECRET` through the workload's secret configuration. Register the exact API-origin
+redirect `${BETTER_AUTH_URL}/v1/auth/oauth2/callback/authentik` in authentik; when `BETTER_AUTH_URL`
+is unset, use `APP_URL` as the origin. The client requests `openid profile email` with PKCE and
+requires a verified email. Existing organization membership checks still govern workspace access.
+
+All runtime LLM slots use Z.ai `glm-5.3-flash` directly. Provide a **standard model API**
+`ZAI_API_KEY`; a Coding Plan key is a separate credential. The managed CLI proxy also needs
+`LLM_PROXY_ENABLED=true` and uses the same model and prices. Remove old investigation model
+overrides or set them to this model ID. Historical registry names are compatibility aliases;
+they do not route through the former providers. Google, Groq, OpenRouter and OpenAI keys are not
+required. See the [Z.ai API documentation](https://docs.z.ai/guides/overview/quick-start).
+
+Repository access is separate from sign-in: configure the repo-facing GitHub App using
+`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` (base64 PEM), `GITHUB_APP_WEBHOOK_SECRET`, and
+`GITHUB_APP_SLUG`, then install it on the intended organization repositories and connect that
+installation from Autonoma. Authentik does not grant repository access.

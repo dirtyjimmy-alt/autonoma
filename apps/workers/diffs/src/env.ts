@@ -14,10 +14,6 @@ export const env = createEnv({
         GITHUB_APP_PRIVATE_KEY: base64PrivateKey,
         GITHUB_APP_WEBHOOK_SECRET: z.string().min(1),
         GITHUB_APP_SLUG: z.string().min(1),
-        // The native-OpenAI key the analysis model session is built from. OPTIONAL so the worker still boots
-        // without it: createModelSession throws at call time instead, failing one analysis run rather than the
-        // whole worker. The OpenRouter/Gemini/Groq keys are read by @autonoma/ai from its own env.
-        OPENAI_API_KEY: z.string().min(1).optional(),
         // Optional rather than defaulted: the model session owns each capability's default, and a `.default()`
         // here would be a second copy of it.
         INVESTIGATION_CLASSIFIER_MODEL: z.string().optional(),

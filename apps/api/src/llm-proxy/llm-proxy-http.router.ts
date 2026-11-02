@@ -1,7 +1,9 @@
+import { zaiFetch } from "@autonoma/ai";
 import { requireApiKey, type UserAuthVariables } from "@autonoma/auth";
 import type { LlmProxyGateReason } from "@autonoma/billing";
 import { db } from "@autonoma/db";
 import { logger as rootLogger } from "@autonoma/logger";
+import { ZAI_MODEL } from "@autonoma/types";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
@@ -10,9 +12,9 @@ import { env } from "../env";
 
 const logger = rootLogger.child({ name: "llmProxyHttpRouter" });
 
-const OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions";
+const ZAI_CHAT_COMPLETIONS_URL = `${ZAI_MODEL.baseUrl}/chat/completions`;
 
-// Upper bound on a single upstream request. Bounds a hung/stalled OpenRouter
+// Upper bound on a single upstream request. Bounds a hung/stalled Z.ai
 // connection (which would otherwise hold the request and the detached meter
 // drain open indefinitely) while staying well above any real planner call.
 const UPSTREAM_TIMEOUT_MS = 300_000;
@@ -21,7 +23,7 @@ const UPSTREAM_TIMEOUT_MS = 300_000;
 // credit-metered gateway, so restricting the routable models is the main guard
 // against it being used as a general-purpose LLM API. Override with the
 // LLM_PROXY_ALLOWED_MODELS env var (comma-separated) without a deploy.
-const LLM_PROXY_DEFAULT_MODELS = ["google/gemini-3-flash-preview"];
+const LLM_PROXY_DEFAULT_MODELS = [ZAI_MODEL.id];
 
 const configuredModels =
     env.LLM_PROXY_ALLOWED_MODELS?.split(",")
@@ -30,6 +32,9 @@ const configuredModels =
 // An empty/whitespace-only override falls back to the defaults rather than
 // silently blocking every model with a 400.
 const allowedModels = new Set(configuredModels.length > 0 ? configuredModels : LLM_PROXY_DEFAULT_MODELS);
+if (Array.from(allowedModels).some((model) => model !== ZAI_MODEL.id)) {
+    throw new Error(`LLM_PROXY_ALLOWED_MODELS only supports ${ZAI_MODEL.id}`);
+}
 
 // Per-request caps (all env-overridable). The credit cap is the primary abuse
 // bound (see checkLlmProxyGate); these keep a single request cheap so the tiny
@@ -53,27 +58,38 @@ const GATE_BLOCK_RESPONSES: Record<LlmProxyGateReason, { error: string; message:
     },
 };
 
-// Accepts the OpenAI/OpenRouter chat-completions body but only pins the fields
+// Accepts the OpenAI/Z.ai chat-completions body but only pins the fields
 // we act on (`model` for the allowlist, `stream` for the response shape,
 // `max_tokens` which we clamp). `.passthrough()` preserves every other field so
 // the request forwards verbatim.
 const ChatCompletionsBodySchema = z
     .object({
         model: z.string(),
+        messages: z.array(z.json()).min(1),
         stream: z.boolean().optional(),
         max_tokens: z.number().int().positive().optional(),
+        response_format: z
+            .object({
+                type: z.enum(["text", "json_object", "json_schema"]),
+                json_schema: z.object({ schema: z.json() }).passthrough().optional(),
+            })
+            .passthrough()
+            .optional(),
     })
     .passthrough();
 
-// Tolerant view over OpenRouter responses (streamed chunks and the non-streamed
+// Tolerant view over Z.ai responses (streamed chunks and the non-streamed
 // body) used only to pull the generation id and the usage cost for metering.
 const UsageEnvelopeSchema = z
     .object({
         id: z.string().optional(),
         usage: z
             .object({
-                cost: z.number().optional(),
-                cost_details: z.object({ upstream_inference_cost: z.number().optional() }).passthrough().optional(),
+                prompt_tokens: z.number().int().nonnegative().optional(),
+                completion_tokens: z.number().int().nonnegative().optional(),
+                prompt_tokens_details: z
+                    .object({ cached_tokens: z.number().int().nonnegative().optional() })
+                    .optional(),
             })
             .passthrough()
             .optional(),
@@ -82,20 +98,17 @@ const UsageEnvelopeSchema = z
 
 type CapturedUsage = { id?: string; cost?: number };
 
-/**
- * The dollar cost OpenRouter actually incurred for a request. For BYOK
- * integrations OpenRouter reports `usage.cost = 0` (the spend lands on the
- * upstream provider key it holds for us), so fall back to the upstream inference
- * cost. Keeps metering correct in both BYOK and normal billing modes.
- */
-function effectiveUsageCost(
-    usage: { cost?: number; cost_details?: { upstream_inference_cost?: number } } | undefined,
-): number | undefined {
+/** Compute USD cost from Z.ai token usage and the shared model prices. */
+function effectiveUsageCost(usage: z.infer<typeof UsageEnvelopeSchema>["usage"]): number | undefined {
     if (usage == null) return undefined;
-    if (usage.cost != null && usage.cost > 0) return usage.cost;
-    const upstream = usage.cost_details?.upstream_inference_cost;
-    if (upstream != null && upstream > 0) return upstream;
-    return undefined;
+    if (usage.prompt_tokens == null || usage.completion_tokens == null) return undefined;
+    const cachedTokens = Math.min(usage.prompt_tokens_details?.cached_tokens ?? 0, usage.prompt_tokens);
+    return (
+        ((usage.prompt_tokens - cachedTokens) * ZAI_MODEL.inputCostPerM +
+            cachedTokens * ZAI_MODEL.cachedInputCostPerM +
+            usage.completion_tokens * ZAI_MODEL.outputCostPerM) /
+        1_000_000
+    );
 }
 
 export const llmProxyHttpRouter = new Hono<{ Variables: UserAuthVariables }>();
@@ -118,9 +131,9 @@ llmProxyHttpRouter.post("/chat/completions", async (c) => {
     const { organizationId } = c.var.user;
     logger.info("LLM proxy request received", { organizationId });
 
-    const apiKey = env.OPENROUTER_API_KEY;
+    const apiKey = env.ZAI_API_KEY;
     if (apiKey == null) {
-        logger.error("LLM proxy is unconfigured - OPENROUTER_API_KEY is not set");
+        logger.error("LLM proxy is unconfigured - ZAI_API_KEY is not set");
         return c.json({ error: "llm_proxy_unconfigured" }, 503);
     }
 
@@ -146,22 +159,23 @@ llmProxyHttpRouter.post("/chat/completions", async (c) => {
     const isStreaming = parsedBody.data.stream === true;
     // Clamp the output ceiling (and set it when the caller omits it) so an
     // allowlisted model can't be driven with an unbounded generation. Ask
-    // OpenRouter to include usage accounting (incl. dollar cost) so we can meter -
-    // for streams this surfaces in a trailing chunk; non-stream in the body.
+    // Z.ai to include token usage for metering; streams carry it in a trailing chunk.
     const maxTokens = Math.min(parsedBody.data.max_tokens ?? MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS);
-    const forwardBody = { ...parsedBody.data, max_tokens: maxTokens, usage: { include: true } };
+    const forwardBody = {
+        ...parsedBody.data,
+        max_tokens: maxTokens,
+        stream_options: isStreaming ? { include_usage: true } : undefined,
+    };
 
-    logger.info("Forwarding to OpenRouter", { organizationId, model, isStreaming });
+    logger.info("Forwarding to Z.ai", { organizationId, model, isStreaming });
 
     let upstream: Response;
     try {
-        upstream = await fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
+        upstream = await zaiFetch(ZAI_CHAT_COMPLETIONS_URL, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
                 Authorization: `Bearer ${apiKey}`,
-                "HTTP-Referer": "https://autonoma.app",
-                "X-Title": "Autonoma Planner",
             },
             body: JSON.stringify(forwardBody),
             signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
@@ -174,10 +188,9 @@ llmProxyHttpRouter.post("/chat/completions", async (c) => {
     }
 
     if (!upstream.ok || upstream.body == null) {
-        // Don't leak OpenRouter's identity or our account's auth/rate-limit state
+        // Don't leak Z.ai's identity or our account's auth/rate-limit state
         // to the caller - log the upstream detail server-side, return a generic 502.
-        const detail = await upstream.text().catch(() => "");
-        logger.warn("OpenRouter returned an error", { organizationId, model, status: upstream.status, detail });
+        logger.warn("Z.ai returned an error", { organizationId, model, status: upstream.status });
         return c.json({ error: "upstream_error" }, 502);
     }
 
@@ -253,11 +266,11 @@ async function meter(organizationId: string, captured: CapturedUsage): Promise<v
         logger.warn("No usage cost captured for LLM proxy request - skipping deduction", { organizationId });
         return;
     }
-    // Deduction keys on the OpenRouter generation id for idempotency. Without it
+    // Deduction keys on the Z.ai generation id for idempotency. Without it
     // we'd have to mint a synthetic id, which a re-delivery could double-charge,
     // so skip (log) rather than risk an unbounded charge.
     if (captured.id == null) {
-        logger.warn("No OpenRouter generation id captured for LLM proxy request - skipping deduction", {
+        logger.warn("No Z.ai generation id captured for LLM proxy request - skipping deduction", {
             organizationId,
         });
         return;
@@ -273,7 +286,7 @@ function safeJsonParse(text: string): unknown {
     try {
         return JSON.parse(text);
     } catch (err) {
-        logger.debug("Failed to parse JSON from OpenRouter response", { err });
+        logger.debug("Failed to parse JSON from Z.ai response", { err });
         return undefined;
     }
 }

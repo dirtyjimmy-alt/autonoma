@@ -1,11 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
-import { GoogleGenAI } from "@google/genai";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { env } from "../src/env";
 import { ObjectGenerator } from "../src/object/object-generator";
-import { VideoProcessor } from "../src/object/video/video-processor";
 import { MODEL_ENTRIES } from "../src/registry/model-entries";
 import { ModelRegistry } from "../src/registry/model-registry";
 
@@ -18,15 +15,12 @@ describe("video analysis", () => {
             const registry = new ModelRegistry({
                 models: { GEMINI: MODEL_ENTRIES.GEMINI_3_FLASH_PREVIEW },
             });
-            const model = registry.getModel({
+            const { model, uploader } = registry.getVideoModel({
                 model: "GEMINI",
                 tag: "video-analysis-test",
             });
 
-            const genAI = new GoogleGenAI({ apiKey: env.GEMINI_API_KEY });
-            const videoProcessor = new VideoProcessor(genAI);
-
-            const uploadedVideo = await videoProcessor.uploadVideo({
+            const uploadedVideo = await uploader.uploadVideo({
                 data: { type: "file", path: VIDEO_PATH },
                 mimeType: "video/webm",
             });

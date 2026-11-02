@@ -1,7 +1,7 @@
 import { isPreviewHostname } from "@autonoma/types";
 import { apiKeyClient } from "@better-auth/api-key/client";
 import { useRouteContext } from "@tanstack/react-router";
-import { inferAdditionalFields, organizationClient } from "better-auth/client/plugins";
+import { genericOAuthClient, inferAdditionalFields, organizationClient } from "better-auth/client/plugins";
 import { createAuthClient } from "better-auth/react";
 import { env } from "env";
 import { useSession } from "lib/query/auth.queries";
@@ -24,6 +24,7 @@ export const authClient = createAuthClient({
     baseURL: getBaseURL(),
     basePath: "/v1/auth",
     plugins: [
+        genericOAuthClient(),
         organizationClient(),
         apiKeyClient(),
         inferAdditionalFields({

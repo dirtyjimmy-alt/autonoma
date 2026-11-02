@@ -1,4 +1,5 @@
 export * from "./schemas/index";
+export { ZAI_MODEL } from "./zai-model";
 export * from "./schemas/billing";
 export * from "./schemas/github";
 export * from "./schemas/vercel";

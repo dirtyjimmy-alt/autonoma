@@ -1,4 +1,4 @@
-import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { MODEL_ENTRIES } from "@autonoma/ai";
 import { AssertChecker, GeminiObjectDetector, ObjectPointDetector } from "@autonoma/visual-ai";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type Browser, remote } from "webdriverio";
@@ -10,11 +10,8 @@ const APPIUM_HOST = process.env.APPIUM_HOST ?? "localhost";
 const APPIUM_PORT = Number(process.env.APPIUM_PORT ?? "4723");
 const DEVICE_NAME = process.env.DEVICE_NAME ?? "emulator-5554";
 
-function createGeminiModel() {
-    const geminiApiKey = process.env.GEMINI_API_KEY;
-    if (geminiApiKey == null) throw new Error("GEMINI_API_KEY env var is required");
-    const google = createGoogleGenerativeAI({ apiKey: geminiApiKey });
-    return google("gemini-3-flash-preview");
+function createTestModel() {
+    return MODEL_ENTRIES.ZAI_GLM_FLASH.createModel();
 }
 
 describe.runIf(process.env.RUN_E2E)("Appium drivers e2e", () => {
@@ -78,7 +75,7 @@ describe.runIf(process.env.RUN_E2E)("Appium drivers e2e", () => {
 
         // Take screenshot and verify with AI
         const screenshot = await screen.screenshot();
-        const model = createGeminiModel();
+        const model = createTestModel();
         const checker = new AssertChecker(model);
 
         const result = await checker.checkCondition(
@@ -90,7 +87,7 @@ describe.runIf(process.env.RUN_E2E)("Appium drivers e2e", () => {
     }, 60_000);
 
     it("can scroll at an AI-detected point", async () => {
-        const model = createGeminiModel();
+        const model = createTestModel();
         const pointDetector = new ObjectPointDetector(new GeminiObjectDetector(model));
         const checker = new AssertChecker(model);
 
