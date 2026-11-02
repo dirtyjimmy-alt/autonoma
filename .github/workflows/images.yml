@@ -4,7 +4,7 @@ name: Images
 # self-contained (see each Dockerfile). On a pull request the images are built and discarded, which
 # is what proves the Dockerfiles; on main (and on demand) they are pushed to GHCR as
 # ghcr.io/<owner>/autonoma-<name>:sha-<12 chars>, and the bump job hands the pinned tag@digest
-# references to infra-gitops.
+# references to infra-gitops: a pull request there, merged by this workflow once its checks pass.
 
 on:
   pull_request:
@@ -123,12 +123,36 @@ jobs:
             echo "::notice title=GHCR package not public::autonoma-${{ matrix.image.name }} is '${visibility}'. Make it public once in the package settings (Danger Zone -> Change visibility) so the cluster can pull it without credentials."
           fi
 
+  # Delivers the pushed references to infra-gitops and merges them itself. That repository has
+  # auto-merge disabled and, on its plan, no branch protection, so nothing on GitHub's side merges
+  # for us: this job opens the pull request, waits for every check run on it and squash-merges it
+  # when all of them succeeded. Otherwise the pull request stays open and the job fails.
+  #
+  # The GitHub App behind INFRA_GITOPS_BUMP_APP_ID / INFRA_GITOPS_BUMP_APP_PRIVATE_KEY is installed
+  # on infra-gitops with these repository permissions, and no others:
+  #   Contents: read and write       push the autonoma-images/* branch, merge the pull request
+  #   Pull requests: read and write  open, comment on, close and merge pull requests
+  #   Checks: read                   the check runs `gh pr checks` waits for
+  #   Commit statuses: read          the commit statuses `gh pr checks` waits for
+  #   Metadata: read                 granted to every installation
+  # The App token is not GITHUB_TOKEN, so infra-gitops workflows run on its pull requests as on
+  # anyone else's.
+  #
+  # Ordering: only the commit at the head of main bumps; a run for an older commit leaves the bump
+  # to the newer commit's run. One bump runs at a time and a newer one cancels an older one still in
+  # flight; every open autonoma-images/* pull request for another commit is then closed as
+  # superseded (commented, not deleted). A rerun for the same commit reuses its branch and pull
+  # request when they already hold the same content. Merged head branches are left in place; the
+  # infra-gitops setting "Automatically delete head branches" is the place to change that.
   bump:
     name: Bump infra-gitops
     if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 50
+    concurrency:
+      group: infra-gitops-bump
+      cancel-in-progress: true
     permissions:
       contents: read
     env:
@@ -136,17 +160,36 @@ jobs:
       BUMP_APP_ID: ${{ secrets.INFRA_GITOPS_BUMP_APP_ID }}
       BUMP_APP_PRIVATE_KEY: ${{ secrets.INFRA_GITOPS_BUMP_APP_PRIVATE_KEY }}
       GITOPS_REPOSITORY: infra-gitops
+      GITOPS: ${{ github.repository_owner }}/infra-gitops
       GITOPS_COMPONENT_DIR: components/autonoma
+      BRANCH_PREFIX: autonoma-images/
+      # How long the pull request's checks may take before it is left open and the job fails.
+      CHECKS_TIMEOUT_MINUTES: 30
+      # How long the first check run may take to appear on a fresh pull request.
+      CHECKS_APPEAR_TIMEOUT_SECONDS: 180
+      SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
-      - name: Check the bump credentials
+      - name: Check the bump credentials and that this commit heads main
         id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          short="${GITHUB_SHA::12}"
+          echo "short=${short}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH_PREFIX}${short}" >> "$GITHUB_OUTPUT"
           if [ -z "$BUMP_APP_ID" ] || [ -z "$BUMP_APP_PRIVATE_KEY" ]; then
             echo "::notice title=infra-gitops bump skipped::Repository secrets INFRA_GITOPS_BUMP_APP_ID and INFRA_GITOPS_BUMP_APP_PRIVATE_KEY are not set. The images were pushed; infra-gitops keeps its current references until the secrets exist."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          head=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::notice title=infra-gitops bump skipped::${short} is not the head of main (${head::12} is). The images were pushed; the run for the head of main delivers the references."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         if: steps.gate.outputs.enabled == 'true'
@@ -177,7 +220,7 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ github.repository_owner }}/${{ env.GITOPS_REPOSITORY }}
+          repository: ${{ env.GITOPS }}
           token: ${{ steps.app-token.outputs.token }}
           path: gitops
 
@@ -187,9 +230,11 @@ jobs:
         run: |
           if [ ! -d "gitops/${GITOPS_COMPONENT_DIR}" ]; then
             echo "::notice title=infra-gitops bump skipped::${GITOPS_REPOSITORY} has no ${GITOPS_COMPONENT_DIR}/ yet; nothing to rewrite."
+            echo "component=false" >> "$GITHUB_OUTPUT"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          echo "component=true" >> "$GITHUB_OUTPUT"
           node autonoma/scripts/bump-gitops-images.mjs "gitops/${GITOPS_COMPONENT_DIR}" refs/* | tee rewrite.log
           if grep -q '^changed: 0$' rewrite.log; then
             echo "::notice title=infra-gitops already current::Every reference under ${GITOPS_COMPONENT_DIR}/ already points at these images."
@@ -198,41 +243,141 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open the pull request
+      # Every open autonoma-images/* pull request for another autonoma commit is older than this one
+      # (only the head of main gets here), so it is closed with a comment; its branch stays. This runs
+      # even when nothing changed, because a stale pull request is stale either way.
+      - name: Close superseded pull requests
+        if: steps.rewrite.outputs.component == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OWN_PREFIX: ${{ steps.gate.outputs.branch }}
+          SHORT: ${{ steps.gate.outputs.short }}
+        run: |
+          gh pr list -R "$GITOPS" --state open --limit 100 --json number,headRefName --jq '.[] | "\(.number) \(.headRefName)"' \
+          | while read -r number head; do
+              case "$head" in
+                "${OWN_PREFIX}"*) continue ;;
+                "${BRANCH_PREFIX}"*) ;;
+                *) continue ;;
+              esac
+              echo "closing ${GITOPS}#${number} (${head}): superseded by ${SHORT}"
+              gh pr comment "$number" -R "$GITOPS" --body "Superseded by autonoma commit ${SHORT} (${SOURCE_URL}), delivered by ${RUN_URL}. Closing this pull request; its branch is left in place."
+              gh pr close "$number" -R "$GITOPS"
+            done
+
+      # The branch is named after the autonoma commit. When a previous attempt already pushed it with
+      # the same component content, that branch (and its open pull request, if any) is reused; when
+      # its content differs (infra-gitops main moved underneath), a branch suffixed with the run id
+      # and attempt is pushed instead, so no branch is ever force-pushed.
+      - name: Publish the branch and the pull request
         if: steps.rewrite.outputs.changed == 'true'
+        id: publish
         working-directory: gitops
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
-          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHORT: ${{ steps.gate.outputs.short }}
+          BRANCH: ${{ steps.gate.outputs.branch }}
         run: |
-          short="${GITHUB_SHA::12}"
-          branch="autonoma-images/${short}"
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
-          git switch -c "$branch"
+          git switch -c "$BRANCH"
           git add "${GITOPS_COMPONENT_DIR}"
           {
-            echo "autonoma: images ${short}"
-            echo
             echo "Source: ${SOURCE_URL}"
             echo "Build: ${RUN_URL}"
             echo
             cat ../refs/*
-          } > ../commit-message.txt
-          git commit -F ../commit-message.txt
-          git push origin "$branch"
-          {
-            echo "Pinned image references for autonoma commit ${short} (${SOURCE_URL})."
-            echo
-            echo '```'
-            cat ../refs/*
-            echo '```'
-            echo
-            echo "Built by ${RUN_URL}."
-          } > ../pr-body.md
-          gh pr create --title "autonoma: images ${short}" --body-file ../pr-body.md --head "$branch" --base main
-          # Auto-merge needs the repository setting "Allow auto-merge" and something for the merge
-          # to wait on; without them GitHub refuses, and the PR is left for a manual merge.
-          gh pr merge --auto --squash "$branch" || echo "::notice title=auto-merge not enabled::The infra-gitops PR for ${short} is open but could not be queued for auto-merge; merge it by hand."
+          } > ../commit-body.txt
+          git commit -m "autonoma: images ${SHORT}" -F ../commit-body.txt
+          branch="$BRANCH"
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+            git fetch --depth=1 origin "refs/heads/${branch}"
+            if git diff --quiet FETCH_HEAD HEAD -- "$GITOPS_COMPONENT_DIR"; then
+              echo "${branch} already holds these references; reusing it"
+            else
+              branch="${BRANCH}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              echo "${BRANCH} exists with different content; publishing ${branch} instead"
+              git push origin "HEAD:refs/heads/${branch}"
+            fi
+          else
+            git push origin "HEAD:refs/heads/${branch}"
+          fi
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          number=$(gh pr list -R "$GITOPS" --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            echo "reusing the open pull request ${GITOPS}#${number} for ${branch}"
+          else
+            {
+              echo "Pinned image references for autonoma commit ${SHORT} (${SOURCE_URL})."
+              echo
+              echo '```'
+              cat ../refs/*
+              echo '```'
+              echo
+              echo "Built by ${RUN_URL}, which merges this pull request once every check on it succeeds."
+            } > ../pr-body.md
+            url=$(gh pr create -R "$GITOPS" --title "autonoma: images ${SHORT}" --body-file ../pr-body.md --head "$branch" --base main)
+            number="${url##*/}"
+            echo "opened ${url}"
+          fi
+          echo "number=${number}" >> "$GITHUB_OUTPUT"
+
+      # `gh pr checks --watch` returns once every check run reported so far has finished; the loop
+      # around it waits for the first one to appear and catches a check that registered late, so a
+      # pull request is never merged while something on it is still pending. Only `pass` counts: a
+      # skipped or cancelled check is not a success and leaves the pull request open.
+      - name: Wait for the pull request checks
+        if: steps.publish.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.publish.outputs.number }}
+          PR_URL: ${{ github.server_url }}/${{ env.GITOPS }}/pull/${{ steps.publish.outputs.number }}
+        run: |
+          started=$(date +%s)
+          deadline=$(( started + CHECKS_TIMEOUT_MINUTES * 60 ))
+          while :; do
+            gh pr checks "$PR" -R "$GITOPS" --json name,bucket,state,link > checks.json 2>/dev/null || echo '[]' > checks.json
+            total=$(jq length checks.json)
+            pending=$(jq '[.[] | select(.bucket == "pending")] | length' checks.json)
+            if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
+              break
+            fi
+            now=$(date +%s)
+            if [ "$total" -eq 0 ] && [ $(( now - started )) -ge "$CHECKS_APPEAR_TIMEOUT_SECONDS" ]; then
+              echo "::error title=infra-gitops bump not merged::No check run appeared on ${GITOPS}#${PR} within ${CHECKS_APPEAR_TIMEOUT_SECONDS}s. The pull request stays open: ${PR_URL}"
+              exit 1
+            fi
+            if [ "$now" -ge "$deadline" ]; then
+              jq -r '.[] | "\(.bucket)\t\(.state)\t\(.name)\t\(.link)"' checks.json
+              echo "::error title=infra-gitops bump not merged::Checks on ${GITOPS}#${PR} did not finish within ${CHECKS_TIMEOUT_MINUTES} minutes. The pull request stays open: ${PR_URL}"
+              exit 1
+            fi
+            if [ "$total" -eq 0 ]; then
+              sleep 10
+            else
+              timeout $(( deadline - now )) gh pr checks "$PR" -R "$GITOPS" --watch --interval 30 || echo "gh pr checks --watch exited with $?"
+              sleep 10
+            fi
+          done
+          jq -r '.[] | "\(.bucket)\t\(.state)\t\(.name)\t\(.link)"' checks.json
+          not_passed=$(jq '[.[] | select(.bucket != "pass")] | length' checks.json)
+          if [ "$not_passed" -ne 0 ]; then
+            echo "::error title=infra-gitops bump not merged::${not_passed} of ${total} checks on ${GITOPS}#${PR} did not succeed (listed above). The pull request stays open for a human: ${PR_URL}"
+            exit 1
+          fi
+          echo "all ${total} checks on ${GITOPS}#${PR} succeeded"
+
+      - name: Merge the pull request
+        if: steps.publish.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.publish.outputs.number }}
+          PR_URL: ${{ github.server_url }}/${{ env.GITOPS }}/pull/${{ steps.publish.outputs.number }}
+          SHORT: ${{ steps.gate.outputs.short }}
+        run: |
+          if ! gh pr merge "$PR" -R "$GITOPS" --squash --subject "autonoma: images ${SHORT}" --body-file commit-body.txt; then
+            echo "::error title=infra-gitops bump not merged::GitHub refused to merge ${GITOPS}#${PR}; see the output above. The pull request stays open: ${PR_URL}"
+            exit 1
+          fi
+          echo "::notice title=infra-gitops bumped::Merged ${GITOPS}#${PR}: autonoma ${SHORT} is on infra-gitops main."
