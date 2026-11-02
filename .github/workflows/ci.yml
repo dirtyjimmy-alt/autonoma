@@ -26,8 +26,12 @@ env:
   # and replay tests, and the worker-diffs eval corpus. Those three packages are taken out of
   # the turbo typecheck/test tasks below; worker-diffs, which ships as an image, is then
   # checked and tested on its own with the eval corpus left out, so a failure there is still
-  # a red check. Drop this once the two directories exist.
-  EVAL_FREE_FILTERS: --filter='!@autonoma/evals' --filter='!@autonoma-ai/planner' --filter='!@autonoma/worker-diffs'
+  # a red check. `--only` goes with the filters: `typecheck` and `test` depend on `^typecheck`,
+  # so without it turbo would still run @autonoma/evals's typecheck as a dependency of the
+  # packages that import it (engine-web), and that is the task that cannot pass here. Each
+  # package's tsc and vitest are independent, so nothing is lost by skipping the edges. Drop
+  # all of this once the two directories exist.
+  EVAL_FREE_FILTERS: --only --filter='!@autonoma/evals' --filter='!@autonoma-ai/planner' --filter='!@autonoma/worker-diffs'
 
 jobs:
   changes:
