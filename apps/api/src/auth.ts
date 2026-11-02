@@ -18,6 +18,8 @@ import type { CookieOptions } from "hono/utils/cookie";
 import type Redis from "ioredis";
 import { authentikProvider } from "./authentik-provider";
 import { env } from "./env";
+import { GoogleHostedDomainGate } from "./google-hosted-domain-gate";
+import { InternalEmailDomains } from "./internal-email-domains";
 import { microsoftDomainAssertion } from "./microsoft-domain-assertion";
 import { PlatformEventEmitter } from "./posthog/emit-platform-events";
 import { resolveSignupOrganizationKey } from "./resolve-signup-organization-key";
@@ -41,7 +43,10 @@ const EMAIL_PROVIDER = "email";
 // to. Those flows emit their own events with VERCEL_PROVIDER.
 const UNKNOWN_PROVIDER = "unknown";
 
-const INTERNAL_DOMAIN = `@${env.INTERNAL_DOMAIN}`;
+// Which addresses are internal, and which Google Workspace domains may sign in at all. Both resolved
+// once from the environment, next to the cookie domain they used to be derived from.
+const INTERNAL_EMAIL_DOMAINS = new InternalEmailDomains(env.INTERNAL_EMAIL_DOMAINS, env.INTERNAL_DOMAIN);
+const GOOGLE_HOSTED_DOMAIN_GATE = new GoogleHostedDomainGate(env.GOOGLE_ALLOWED_HD);
 
 // Password sign-in/sign-up is otherwise disabled in production (social SSO
 // only) - this allowlist carves out an exception for non-SSO test
@@ -350,7 +355,7 @@ export async function ensureOrgMembership(
 
     logger.info(`No membership found for user ${userId} - creating org on login`);
 
-    const isInternal = email.endsWith(INTERNAL_DOMAIN);
+    const isInternal = INTERNAL_EMAIL_DOMAINS.includes(email);
     let orgId: string;
     let orgName: string;
     let orgSlug: string;
@@ -745,6 +750,15 @@ export function buildAuth({ redisClient, conn, platformEvents: injectedPlatformE
                               if (token.idToken == null) return null;
                               const payload = decodeIdTokenPayload(token.idToken);
                               if (payload.email == null || payload.email === "") return null;
+
+                              // Refused before anything is recorded: a null here fails the sign-in at the
+                              // provider step, so no user row and no organization are ever created for it.
+                              if (!GOOGLE_HOSTED_DOMAIN_GATE.allows(payload.hd)) {
+                                  logger.warn("Refusing a Google sign-in outside the allowed Workspace domains", {
+                                      extra: { hostedDomain: payload.hd ?? "none" },
+                                  });
+                                  return null;
+                              }
 
                               // `hd` is Google stating that this address belongs to a Workspace domain it
                               // administers, and it is the whole answer for this provider: signing in as
